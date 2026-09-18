@@ -10,41 +10,88 @@ import {
   Dimensions,
   Pressable,
   Alert,
-  Platform
+  Platform,
+  TextInput,
+  KeyboardAvoidingView,
+  ActivityIndicator
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import * as ImagePicker from 'expo-image-picker';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-// NEW: Import the modal and hook for Limits
+// Import the modal and hook for Limits
 import ManageLimitsModal from '../components/dashboard/ManageLimitsModal';
 import { useTransactions } from '../hooks/useTransactions';
+
+// Import our new API service wrapper
+import { api } from '../services/api';
 
 const { height } = Dimensions.get('window');
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
-const PREBUILT_AVATARS = [
+const PROFILE_AVATARS = [
   'https://api.dicebear.com/7.x/avataaars/png?seed=Felix&backgroundColor=b6e3f4',
   'https://api.dicebear.com/7.x/avataaars/png?seed=Aneka&backgroundColor=c0aede',
   'https://api.dicebear.com/7.x/avataaars/png?seed=Jasper&backgroundColor=d1d4f9',
   'https://api.dicebear.com/7.x/avataaars/png?seed=Destiny&backgroundColor=ffdfbf',
 ];
 
-export default function ProfileScreen() {
-  // Mock Auth State
+// FIX: Added the navigation prop here so we can route the user after login
+export default function ProfileScreen({ navigation }) {
+  // Authentication & User State
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [avatarUri, setAvatarUri] = useState(null);
+  const [user, setUser] = useState({ name: '', username: '' });
+  const [avatarUri, setAvatarUri] = useState(PROFILE_AVATARS[0]);
   
-  // Modals State
+  // Auth Form State
+  const [authMode, setAuthMode] = useState('LOGIN'); // 'LOGIN' or 'REGISTER'
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [name, setName] = useState('');
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
+
+  // Modals Visibility State
   const [isSelectorVisible, setIsSelectorVisible] = useState(false);
   const [isLimitsModalVisible, setIsLimitsModalVisible] = useState(false);
+  const [isAuthModalVisible, setIsAuthModalVisible] = useState(false);
 
   // Fetch Limits Data
   const { accounts, limits, addLimit, deleteLimit } = useTransactions('ALL');
 
-  // Animation Values
+  // Animation Values for Avatar Modal
   const slideAnim = useRef(new Animated.Value(height)).current;
   const fadeAnim = useRef(new Animated.Value(0)).current;
 
+  // Animation Values for Auth Modal
+  const authSlideAnim = useRef(new Animated.Value(height)).current;
+  const authFadeAnim = useRef(new Animated.Value(0)).current;
+
+  // Check for existing session on component mount
+  useEffect(() => {
+    checkExistingSession();
+  }, []);
+
+  const checkExistingSession = async () => {
+    try {
+      const token = await AsyncStorage.getItem('accessToken');
+      const savedUser = await AsyncStorage.getItem('user');
+      const savedAvatar = await AsyncStorage.getItem('avatarUri');
+      
+      if (token && savedUser) {
+        setIsLoggedIn(true);
+        setUser(JSON.parse(savedUser));
+      }
+      if (savedAvatar) {
+        setAvatarUri(savedAvatar);
+      }
+    } catch (error) {
+      console.error('Failed to load session:', error);
+    }
+  };
+
+  // ==========================================
+  // AVATAR SELECTOR ANIMATIONS & LOGIC
+  // ==========================================
   useEffect(() => {
     if (isSelectorVisible) {
       slideAnim.setValue(height);
@@ -63,39 +110,96 @@ export default function ProfileScreen() {
     ]).start(() => setIsSelectorVisible(false));
   };
 
-  const selectPrebuiltAvatar = (uri) => {
+  const selectAvatar = async (uri) => {
     setAvatarUri(uri);
+    await AsyncStorage.setItem('avatarUri', uri);
     closeSelector();
   };
 
-  const uploadCustomAvatar = async () => {
-    if (!isLoggedIn) {
-      Alert.alert(
-        "Sign In Required", 
-        "You must be signed in to your account to upload custom photos.",
-        [{ text: "OK", style: "cancel" }]
-      );
-      return;
+  // ==========================================
+  // AUTHENTICATION MODAL ANIMATIONS & LOGIC
+  // ==========================================
+  useEffect(() => {
+    if (isAuthModalVisible) {
+      authSlideAnim.setValue(height);
+      authFadeAnim.setValue(0);
+      Animated.parallel([
+        Animated.spring(authSlideAnim, { toValue: 0, useNativeDriver: true, bounciness: 4, speed: 12 }),
+        Animated.timing(authFadeAnim, { toValue: 0.6, duration: 200, useNativeDriver: true })
+      ]).start();
     }
+  }, [isAuthModalVisible, authSlideAnim, authFadeAnim]);
 
-    const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    
-    if (permissionResult.granted === false) {
-      Alert.alert("Permission Required", "You need to allow access to your photos to upload an avatar.");
-      return;
-    }
-
-    const pickerResult = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [1, 1], 
-      quality: 0.8,
+  const closeAuthModal = () => {
+    Animated.parallel([
+      Animated.timing(authSlideAnim, { toValue: height, duration: 250, useNativeDriver: true }),
+      Animated.timing(authFadeAnim, { toValue: 0, duration: 250, useNativeDriver: true })
+    ]).start(() => {
+      setIsAuthModalVisible(false);
+      // Reset form fields
+      setUsername('');
+      setPassword('');
+      setName('');
+      setShowPassword(false);
     });
+  };
 
-    if (!pickerResult.canceled) {
-      setAvatarUri(pickerResult.assets[0].uri);
-      closeSelector();
+  const handleAuthSubmit = async () => {
+    if (!username || !password || (authMode === 'REGISTER' && !name)) {
+      Alert.alert('Missing Fields', 'Please fill in all required fields.');
+      return;
     }
+
+    setIsAuthLoading(true);
+    try {
+      let response;
+      if (authMode === 'LOGIN') {
+        response = await api.auth.login({ username: username.toLowerCase().trim(), password });
+      } else {
+        response = await api.auth.register({ name, username: username.toLowerCase().trim(), password });
+      }
+
+      if (response.success && response.data && response.data.accessToken) {
+        const { accessToken, user: backendUser } = response.data;
+
+        await AsyncStorage.setItem('accessToken', accessToken);
+        await AsyncStorage.setItem('user', JSON.stringify(backendUser));
+        
+        setUser(backendUser);
+        setIsLoggedIn(true);
+        closeAuthModal();
+        
+        Alert.alert('Success', `Welcome, ${backendUser.name}!`);
+        
+        if (navigation) {
+          navigation.navigate('MainTabs', { screen: 'Dashboard' });
+        }
+      }
+    } catch (error) {
+      Alert.alert('Authentication Failed', error.message || 'Unable to connect to the server.');
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    Alert.alert(
+      "Sign Out",
+      "Are you sure you want to sign out? Your offline data will remain on this device.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { 
+          text: "Sign Out", 
+          style: "destructive",
+          onPress: async () => {
+            await AsyncStorage.removeItem('accessToken');
+            await AsyncStorage.removeItem('user');
+            setIsLoggedIn(false);
+            setUser({ name: '', username: '' });
+          }
+        }
+      ]
+    );
   };
 
   return (
@@ -108,29 +212,25 @@ export default function ProfileScreen() {
           onPress={() => setIsSelectorVisible(true)}
           style={styles.avatarCompact}
         >
-          {avatarUri ? (
-            <Image source={{ uri: avatarUri }} style={styles.avatarImageCompact} />
-          ) : (
-            <Ionicons name="person" size={32} color="#71717A" />
-          )}
+          <Image source={{ uri: avatarUri }} style={styles.avatarImageCompact} />
           <View style={styles.editBadgeCompact}>
-            <Ionicons name="camera" size={10} color="#09090B" />
+            <Ionicons name="color-palette" size={10} color="#09090B" />
           </View>
         </TouchableOpacity>
         
         <View style={styles.userInfo}>
           <Text style={styles.nameText} numberOfLines={1}>
-            {isLoggedIn ? 'Welcome Back!' : 'Guest User'}
+            {isLoggedIn ? user.name : 'Guest User'}
           </Text>
           <Text style={styles.emailText} numberOfLines={1}>
-            {isLoggedIn ? 'user@example.com' : 'Tap avatar to edit'}
+            {isLoggedIn ? `@${user.username}` : 'Local Offline Mode'}
           </Text>
         </View>
 
         <TouchableOpacity 
           style={[styles.authBtnCompact, isLoggedIn ? styles.signOutBtn : styles.signInBtn]}
           activeOpacity={0.8}
-          onPress={() => setIsLoggedIn(!isLoggedIn)} 
+          onPress={() => isLoggedIn ? handleSignOut() : setIsAuthModalVisible(true)} 
         >
           <Text style={[styles.authBtnText, isLoggedIn && styles.signOutBtnText]}>
             {isLoggedIn ? 'Sign Out' : 'Sign In'}
@@ -138,7 +238,6 @@ export default function ProfileScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* HORIZONTAL DIVIDER */}
       <View style={styles.mainDivider} />
 
       {/* 2. SETTINGS LIST */}
@@ -157,8 +256,6 @@ export default function ProfileScreen() {
           <Ionicons name="chevron-forward" size={20} color="#71717A" />
         </TouchableOpacity>
         
-        {/* You can easily duplicate the TouchableOpacity above to add more settings items later */}
-
       </View>
 
       {/* 3. AVATAR SELECTOR MODAL */}
@@ -176,42 +273,122 @@ export default function ProfileScreen() {
               </TouchableOpacity>
             </View>
 
-            <Text style={styles.subHeading}>In-built Avatars</Text>
             <View style={styles.prebuiltGrid}>
-              {PREBUILT_AVATARS.map((uri, index) => (
+              {PROFILE_AVATARS.map((uri, index) => (
                 <TouchableOpacity 
                   key={index}
                   activeOpacity={0.7}
-                  onPress={() => selectPrebuiltAvatar(uri)}
+                  onPress={() => selectAvatar(uri)}
                   style={[styles.prebuiltAvatarWrapper, avatarUri === uri && styles.selectedAvatarWrapper]}
                 >
                   <Image source={{ uri }} style={styles.prebuiltAvatarImage} />
                 </TouchableOpacity>
               ))}
             </View>
-
-            <View style={styles.modalDivider} />
-
-            <TouchableOpacity 
-              style={[styles.uploadButton, !isLoggedIn && styles.uploadButtonDisabled]}
-              activeOpacity={0.8}
-              onPress={uploadCustomAvatar}
-            >
-              <Ionicons name="images-outline" size={20} color={isLoggedIn ? '#09090B' : '#71717A'} />
-              <Text style={[styles.uploadButtonText, !isLoggedIn && styles.uploadButtonTextDisabled]}>
-                Upload from system
-              </Text>
-              {!isLoggedIn && <Ionicons name="lock-closed" size={16} color="#71717A" style={{ marginLeft: 'auto' }} />}
-            </TouchableOpacity>
-            
-            {!isLoggedIn && (
-              <Text style={styles.loginWarning}>*Sign in to unlock custom uploads</Text>
-            )}
           </Animated.View>
         </View>
       </Modal>
 
-      {/* 4. MANAGE LIMITS MODAL */}
+      {/* 4. AUTHENTICATION MODAL */}
+      <Modal visible={isAuthModalVisible} animationType="none" transparent={true} onRequestClose={closeAuthModal}>
+        <View style={styles.modalWrapper}>
+          <AnimatedPressable
+            style={[StyleSheet.absoluteFill, { backgroundColor: '#000000', opacity: authFadeAnim }]}
+            onPress={closeAuthModal}
+          />
+          <Animated.View style={[styles.modalContent, { transform: [{ translateY: authSlideAnim }] }]}>
+            <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>
+                  {authMode === 'LOGIN' ? 'Welcome Back' : 'Create Account'}
+                </Text>
+                <TouchableOpacity onPress={closeAuthModal}>
+                  <Text style={styles.closeButton}>✕</Text>
+                </TouchableOpacity>
+              </View>
+
+              <Text style={styles.authDescription}>
+                Sign in to backup your transactions to the cloud and enable cross-device syncing.
+              </Text>
+
+              {authMode === 'REGISTER' && (
+                <>
+                  <Text style={styles.inputLabel}>Full Name</Text>
+                  <TextInput 
+                    style={styles.input} 
+                    placeholder="John Doe" 
+                    placeholderTextColor="#71717A" 
+                    value={name} 
+                    onChangeText={setName} 
+                    autoCapitalize="words"
+                  />
+                </>
+              )}
+
+              <Text style={styles.inputLabel}>Username</Text>
+              <TextInput 
+                style={styles.input} 
+                placeholder="johndoe123" 
+                placeholderTextColor="#71717A" 
+                value={username} 
+                onChangeText={setUsername} 
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+
+              <Text style={styles.inputLabel}>Password</Text>
+              <View style={styles.passwordContainer}>
+                <TextInput 
+                  style={styles.passwordInput} 
+                  placeholder="••••••••" 
+                  placeholderTextColor="#71717A" 
+                  value={password} 
+                  onChangeText={setPassword} 
+                  secureTextEntry={!showPassword}
+                />
+                <TouchableOpacity 
+                  style={styles.eyeIconContainer} 
+                  onPress={() => setShowPassword(!showPassword)}
+                >
+                  <Ionicons 
+                    name={showPassword ? "eye-off" : "eye"} 
+                    size={20} 
+                    color="#A1A1AA" 
+                  />
+                </TouchableOpacity>
+              </View>
+
+              <TouchableOpacity 
+                style={styles.submitButton} 
+                activeOpacity={0.8}
+                onPress={handleAuthSubmit}
+                disabled={isAuthLoading}
+              >
+                {isAuthLoading ? (
+                  <ActivityIndicator color="#09090B" />
+                ) : (
+                  <Text style={styles.submitButtonText}>
+                    {authMode === 'LOGIN' ? 'Sign In' : 'Create Account'}
+                  </Text>
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity 
+                style={styles.switchModeButton} 
+                onPress={() => setAuthMode(authMode === 'LOGIN' ? 'REGISTER' : 'LOGIN')}
+              >
+                <Text style={styles.switchModeText}>
+                  {authMode === 'LOGIN' 
+                    ? "Don't have an account? Sign up" 
+                    : "Already have an account? Sign in"}
+                </Text>
+              </TouchableOpacity>
+            </KeyboardAvoidingView>
+          </Animated.View>
+        </View>
+      </Modal>
+
+      {/* 5. MANAGE LIMITS MODAL */}
       <ManageLimitsModal 
         visible={isLimitsModalVisible}
         onClose={() => setIsLimitsModalVisible(false)}
@@ -365,17 +542,10 @@ const styles = StyleSheet.create({
   modalTitle: { fontFamily: 'Jakarta-Bold', fontSize: 20, color: '#FFFFFF' },
   closeButton: { fontFamily: 'Jakarta-Bold', fontSize: 18, color: '#A1A1AA', padding: 4 },
   
-  subHeading: {
-    fontFamily: 'Jakarta-SemiBold',
-    fontSize: 14,
-    color: '#A1A1AA',
-    marginBottom: 16,
-    textTransform: 'uppercase',
-  },
   prebuiltGrid: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 24,
+    marginBottom: 8,
   },
   prebuiltAvatarWrapper: {
     width: 70,
@@ -393,36 +563,79 @@ const styles = StyleSheet.create({
     height: '100%',
     backgroundColor: '#27272A',
   },
-  modalDivider: {
-    height: 1,
-    backgroundColor: '#27272A',
+
+  // Auth Form Styles
+  authDescription: {
+    fontFamily: 'Jakarta-Regular',
+    fontSize: 14,
+    color: '#A1A1AA',
     marginBottom: 24,
+    lineHeight: 20,
   },
-  uploadButton: {
+  inputLabel: { 
+    fontFamily: 'Jakarta-SemiBold', 
+    fontSize: 12, 
+    color: '#A1A1AA', 
+    marginBottom: 6, 
+    textTransform: 'uppercase' 
+  },
+  input: { 
+    fontFamily: 'Jakarta-Regular', 
+    backgroundColor: '#09090B', 
+    borderWidth: 1, 
+    borderColor: '#27272A', 
+    borderRadius: 12, 
+    paddingHorizontal: 16, 
+    paddingVertical: 12, 
+    fontSize: 16, 
+    color: '#FFFFFF', 
+    marginBottom: 16 
+  },
+  
+  // Password Input Container Styles
+  passwordContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#FFFFFF',
-    paddingVertical: 16,
-    paddingHorizontal: 20,
-    borderRadius: 14,
+    backgroundColor: '#09090B',
+    borderWidth: 1,
+    borderColor: '#27272A',
+    borderRadius: 12,
+    marginBottom: 16,
   },
-  uploadButtonDisabled: {
-    backgroundColor: '#27272A',
-  },
-  uploadButtonText: {
-    fontFamily: 'Jakarta-Bold',
-    fontSize: 16,
-    color: '#09090B',
-    marginLeft: 12,
-  },
-  uploadButtonTextDisabled: {
-    color: '#71717A',
-  },
-  loginWarning: {
+  passwordInput: {
+    flex: 1,
     fontFamily: 'Jakarta-Regular',
-    fontSize: 12,
-    color: '#EF4444',
-    textAlign: 'center',
-    marginTop: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    fontSize: 16,
+    color: '#FFFFFF',
+  },
+  eyeIconContainer: {
+    paddingHorizontal: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+
+  submitButton: { 
+    backgroundColor: '#FFFFFF', 
+    paddingVertical: 16, 
+    borderRadius: 14, 
+    alignItems: 'center', 
+    marginTop: 8 
+  },
+  submitButtonText: { 
+    fontFamily: 'Jakarta-Bold', 
+    color: '#09090B', 
+    fontSize: 16 
+  },
+  switchModeButton: {
+    alignItems: 'center',
+    paddingVertical: 16,
+    marginTop: 8,
+  },
+  switchModeText: {
+    fontFamily: 'Jakarta-SemiBold',
+    fontSize: 14,
+    color: '#A1A1AA',
   }
 });

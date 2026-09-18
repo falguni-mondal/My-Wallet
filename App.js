@@ -26,6 +26,9 @@ import DashboardScreen from "./screens/DashboardScreen";
 import AnalyticsScreen from "./screens/AnalyticsScreen";
 import ProfileScreen from "./screens/ProfileScreen";
 
+// Import the SMS Sync hook
+import { useSmsSync } from "./hooks/useSmsSync";
+
 const Tab = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
 
@@ -113,6 +116,9 @@ export default function App() {
     "Jakarta-Bold": PlusJakartaSans_700Bold,
     "Jakarta-ExtraBold": PlusJakartaSans_800ExtraBold,
   });
+
+  // Initialize the background SMS listener globally
+  useSmsSync();
 
   if (!fontsLoaded) {
     return null;

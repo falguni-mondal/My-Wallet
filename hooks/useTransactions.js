@@ -4,6 +4,8 @@ import { format, subDays, subMonths, subYears } from 'date-fns';
 import { getDB } from '../services/database';
 import * as Haptics from 'expo-haptics';
 import { useAudioPlayer } from 'expo-audio';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { api } from '../services/api';
 
 const DEFAULT_ACCOUNT_ID = 'cash_wallet_1';
 
@@ -15,7 +17,6 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
   const [isLoading, setIsLoading] = useState(true);
 
   // Initialize the audio player at the hook level. 
-  // (Assuming your assets folder is one level up in the root directory)
   const alarmPlayer = useAudioPlayer(require('../assets/alarm.mp3'));
 
   const loadTransactions = useCallback(async () => {
@@ -75,6 +76,42 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
     loadTransactions();
   }, [loadTransactions]);
 
+  // ==========================================
+  // THE MIGRATION ENGINE (Guest to Authenticated)
+  // ==========================================
+  const syncOfflineData = async () => {
+    try {
+      const token = await AsyncStorage.getItem('accessToken');
+      if (!token) return;
+
+      const db = await getDB();
+      const localTxs = await db.getAllAsync('SELECT * FROM Transactions');
+      
+      let syncedCount = 0;
+      
+      // Sweep local SQLite and push everything to MongoDB using the endpoint we already built
+      for (const tx of localTxs) {
+        try {
+          await api.transactions.syncSms({
+            amount: Math.abs(tx.amount),
+            type: tx.type || (tx.amount < 0 ? 'EXPENSE' : 'INCOME'),
+            merchant: tx.title,
+            accountMask: null, 
+            smsIdentifier: `manual_${tx.id}`, // Ensures the backend doesn't duplicate this
+            rawSmsBody: 'Offline Data Migration',
+            transactionDate: tx.date
+          });
+          syncedCount++;
+        } catch(e) {
+          // Silently ignore duplicates caught by the backend idempotency index
+        } 
+      }
+      Alert.alert("Cloud Sync Complete ☁️", `${syncedCount} offline transactions securely backed up to MongoDB.`);
+    } catch(error) {
+      console.error('Migration failed:', error);
+    }
+  };
+
   const addTransaction = async (newTransaction) => {
     try {
       const db = await getDB();
@@ -82,7 +119,7 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
       const targetAccountId = selectedAccountId !== 'ALL' ? selectedAccountId : DEFAULT_ACCOUNT_ID;
       
       // ==========================================
-      // THE PROACTIVE BUDGETING ENGINE
+      // THE PROACTIVE BUDGETING ENGINE (Local)
       // ==========================================
       const isExpense = newTransaction.type === 'EXPENSE' || (newTransaction.amount < 0 && newTransaction.type !== 'TRANSFER');
       
@@ -114,45 +151,36 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
 
           const sumResult = await db.getAllAsync(sumQuery, sumParams);
           const currentSpent = Math.abs(sumResult[0]?.total || 0);
-
           const thresholdAmount = limit.limitAmount * (limit.thresholdPercentage / 100);
           
           if ((currentSpent + expenseAmount) >= thresholdAmount) {
-            
             // 🔥 ORCHESTRATED ALARM ENGINE 🔥
             const fireWarning = async () => {
               let minTimeMet = false;
               let popupClosed = false;
               let hapticInterval;
 
-              // Function to kill the alarm entirely
               const stopAlarms = () => {
                 clearInterval(hapticInterval);
                 Vibration.cancel();
-                alarmPlayer.pause(); // <-- Stop audio when user acknowledges
+                alarmPlayer.pause(); 
               };
 
-              // 1. Wait for UI to settle (prevents success haptic from canceling this out)
               await new Promise(resolve => setTimeout(resolve, 500));
               
-              // 2. Start Audio Alarm
               alarmPlayer.seekTo(0);
               alarmPlayer.play();
 
-              // 3. Start aggressive hardware looping
               Vibration.vibrate([0, 400, 100], true); 
               hapticInterval = setInterval(() => {
                 Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
               }, 150);
 
-              // 4. Start the 3-second minimum enforcement clock
               setTimeout(() => {
                 minTimeMet = true;
-                // If the user already closed the popup, stop it now.
                 if (popupClosed) stopAlarms();
               }, 3000);
               
-              // 5. Show the visual alert
               const accountName = limit.accountId === 'ALL' ? 'All Accounts' : 'this account';
               const duration = `${limit.timeframeValue}-${limit.timeframeType.toLowerCase()}`;
               
@@ -163,16 +191,13 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
                   text: "Understood", 
                   onPress: () => {
                     popupClosed = true;
-                    // If 3 seconds have passed, kill it. If not, the setTimeout above will kill it later.
                     if (minTimeMet) stopAlarms();
                   } 
                 }],
-                // Prevent tapping outside the box to bypass the button press
                 { cancelable: false } 
               );
             };
 
-            // Execute the sequence asynchronously
             fireWarning();
             break; 
           }
@@ -180,6 +205,7 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
       }
       // ==========================================
 
+      // 1. SAVE TO LOCAL SQLITE FIRST
       if (newTransaction.type === 'TRANSFER') {
         const id1 = newTransaction.id; 
         const id2 = newTransaction.id + '_linked'; 
@@ -209,7 +235,42 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
         );
       }
       
+      // Update UI Instantly
       await loadTransactions();
+
+      // 2. GHOST SYNC TO MONGODB (If Authenticated)
+      const token = await AsyncStorage.getItem('accessToken');
+      if (token) {
+        try {
+          if (newTransaction.type === 'TRANSFER') {
+            await api.transactions.syncSms({
+              amount: Math.abs(newTransaction.amount),
+              type: 'EXPENSE',
+              merchant: newTransaction.title + ' (Transfer Out)',
+              smsIdentifier: `manual_${newTransaction.id}_out`,
+              transactionDate: isoDate
+            });
+            await api.transactions.syncSms({
+              amount: Math.abs(newTransaction.amount),
+              type: 'INCOME',
+              merchant: newTransaction.title + ' (Transfer In)',
+              smsIdentifier: `manual_${newTransaction.id}_in`,
+              transactionDate: isoDate
+            });
+          } else {
+            await api.transactions.syncSms({
+              amount: Math.abs(newTransaction.amount),
+              type: newTransaction.type || (newTransaction.amount < 0 ? 'EXPENSE' : 'INCOME'),
+              merchant: newTransaction.title,
+              smsIdentifier: `manual_${newTransaction.id}`,
+              transactionDate: isoDate
+            });
+          }
+        } catch (cloudError) {
+          console.log('Background cloud sync failed. Saved locally.', cloudError.message);
+        }
+      }
+
     } catch (error) {
       console.error('Failed to save transaction', error);
     }
@@ -228,6 +289,20 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
         ]
       );
       await loadTransactions();
+
+      // Ghost Sync to MongoDB
+      const token = await AsyncStorage.getItem('accessToken');
+      if (token) {
+        try {
+          await api.transactions.update(updatedTransaction.id, {
+            merchant: updatedTransaction.title,
+            amount: Math.abs(updatedTransaction.amount),
+            category: updatedTransaction.category
+          });
+        } catch (e) {
+          console.log('Background update failed or endpoint not yet built.', e.message);
+        }
+      }
     } catch (error) {
       console.error('Failed to update transaction', error);
     }
@@ -243,6 +318,16 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
         await db.runAsync('DELETE FROM Transactions WHERE id = ?', [tx.linkedTransactionId]);
       }
       await loadTransactions();
+
+      // Ghost Sync to MongoDB
+      const token = await AsyncStorage.getItem('accessToken');
+      if (token) {
+        try {
+          await api.transactions.delete(id);
+        } catch (e) {
+          console.log('Background delete failed or endpoint not yet built.', e.message);
+        }
+      }
     } catch (error) {
       console.error('Failed to delete transaction', error);
     }
@@ -288,6 +373,7 @@ export const useTransactions = (selectedAccountId = 'ALL') => {
     updateTransaction, 
     deleteTransaction,
     addLimit, 
-    deleteLimit 
+    deleteLimit,
+    syncOfflineData // Exported so ProfileScreen can trigger it
   };
 };
